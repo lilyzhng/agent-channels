@@ -126,9 +126,11 @@ async function postReply(msg: Message, text: string): Promise<void> {
 // timeouts self-exit for a systemd restart) and adds session respawn: if the
 // acp process has died, drop our handle so the next message starts a fresh one.
 async function processViaAcp(msg: Message, prompt: string): Promise<void> {
+  const started = Date.now()
   try {
     const raw = await getAcp().prompt(prompt)
     consecutiveTimeouts = 0
+    process.stderr.write(`bridge: acp turn done in ${((Date.now() - started) / 1000).toFixed(1)}s\n`)
     const text = extractBridgeReply(raw)
     if (!text) {
       process.stderr.write('bridge: acp returned empty reply; no Discord post\n')
