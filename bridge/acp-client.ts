@@ -101,15 +101,26 @@ export class AcpSession {
   }
 
   private async init(cwd: string): Promise<void> {
+    // We do not provide client-side fs or terminal: cursor-agent uses its own
+    // file and shell tools (verified: it reads files and runs commands itself).
+    // Advertise false so it never delegates an fs/* call to our no-op handler.
     await this.request('initialize', {
       protocolVersion: 1,
-      clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: false },
+      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
     })
     const r = await this.request('session/new', { cwd, mcpServers: [] })
     this.sessionId = r.sessionId
   }
 
-  /** Send a prompt into the shared warm session; resolve with the assembled reply text. */
+  /**
+   * Send a prompt into the shared warm session; resolve with the assembled reply text.
+   *
+   * Correctness depends on serial execution: `chunkBuf` is a single shared buffer and
+   * the streamed `agent_message_chunk` notifications carry no request id, so two
+   * overlapping prompts would interleave into the same buffer. The daemon guarantees
+   * this — `drainQueue` is `busy`-guarded and `await`s each `processMessage`, so only
+   * one prompt() is ever in flight across all channels. Do not call this concurrently.
+   */
   async prompt(text: string): Promise<string> {
     await this.ready
     this.chunkBuf = []

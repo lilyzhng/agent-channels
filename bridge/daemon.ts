@@ -15,7 +15,9 @@ import { loadStateEnv } from '../shared/env.js'
 import { buildAgentPrompt, extractBridgeReply, formatChannelBlock } from '../shared/format-inbound.js'
 import { gate } from '../shared/gate.js'
 import { ENV_FILE } from '../shared/paths.js'
-import { existsSync, statSync } from 'fs'
+import { existsSync, realpathSync, statSync } from 'fs'
+import { tmpdir } from 'os'
+import { resolve } from 'path'
 import { ensureCursorSubscriptionAuth } from './auth.js'
 import { AcpSession } from './acp-client.js'
 import { runCursorAgent } from './run-agent.js'
@@ -99,6 +101,19 @@ function replyThreadName(msg: Message): string {
 // bad path never blocks the text reply.
 const MAX_ATTACH_BYTES = 24 * 1024 * 1024 // Discord's non-Nitro upload ceiling
 
+// ATTACH paths come from agent output that is driven by (untrusted) inbound
+// messages, so a prompt-injected `ATTACH: /home/.../.env` must not exfiltrate
+// secrets. Confine uploads to a few safe roots: render output in the temp dir and
+// the agent's own workspace. Symlinks are resolved (realpath) before the check so
+// a symlink inside an allowed root can't escape it. Override with CDC_ATTACH_ROOTS
+// (colon-separated).
+const ATTACH_ROOTS = (process.env.CDC_ATTACH_ROOTS ?? `/tmp:${tmpdir()}:${CWD}`)
+  .split(':').filter(Boolean).map(r => resolve(r))
+
+function attachPathAllowed(realPath: string): boolean {
+  return ATTACH_ROOTS.some(root => realPath === root || realPath.startsWith(root + '/'))
+}
+
 function extractAttachments(text: string): { text: string; files: string[] } {
   const files: string[] = []
   const kept: string[] = []
@@ -107,10 +122,13 @@ function extractAttachments(text: string): { text: string; files: string[] } {
     if (!m) { kept.push(line); continue }
     const p = m[1]
     try {
-      if (existsSync(p) && statSync(p).size <= MAX_ATTACH_BYTES) files.push(p)
-      else process.stderr.write(`bridge: ATTACH dropped (missing or >24MB): ${p}\n`)
+      if (!existsSync(p)) { process.stderr.write(`bridge: ATTACH dropped (missing): ${p}\n`); continue }
+      const real = realpathSync(p)
+      if (!attachPathAllowed(real)) { process.stderr.write(`bridge: ATTACH dropped (outside allowed roots): ${p}\n`); continue }
+      if (statSync(real).size > MAX_ATTACH_BYTES) { process.stderr.write(`bridge: ATTACH dropped (>24MB): ${p}\n`); continue }
+      files.push(real)
     } catch {
-      process.stderr.write(`bridge: ATTACH dropped (stat failed): ${p}\n`)
+      process.stderr.write(`bridge: ATTACH dropped (resolve/stat failed): ${p}\n`)
     }
   }
   return { text: kept.join('\n').trim(), files }
