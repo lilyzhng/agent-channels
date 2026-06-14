@@ -15,6 +15,7 @@ import { loadStateEnv } from '../shared/env.js'
 import { buildAgentPrompt, extractBridgeReply, formatChannelBlock } from '../shared/format-inbound.js'
 import { gate } from '../shared/gate.js'
 import { ENV_FILE } from '../shared/paths.js'
+import { existsSync, statSync } from 'fs'
 import { ensureCursorSubscriptionAuth } from './auth.js'
 import { AcpSession } from './acp-client.js'
 import { runCursorAgent } from './run-agent.js'
@@ -91,9 +92,40 @@ function replyThreadName(msg: Message): string {
   return (base ? base.slice(0, 80) : `${msg.author.username} thread`) || 'thread'
 }
 
-async function postReply(msg: Message, text: string): Promise<void> {
+// Agents reply with plain text; the bridge posts it. To send a file (an image,
+// a rendered diagram), an agent adds a line `ATTACH: /abs/path` (one per file).
+// We strip those lines and upload the files alongside the remaining text. Paths
+// must be absolute and exist; oversized/missing ones are dropped with a log so a
+// bad path never blocks the text reply.
+const MAX_ATTACH_BYTES = 24 * 1024 * 1024 // Discord's non-Nitro upload ceiling
+
+function extractAttachments(text: string): { text: string; files: string[] } {
+  const files: string[] = []
+  const kept: string[] = []
+  for (const line of text.split('\n')) {
+    const m = /^\s*ATTACH:\s*(\/\S.*?)\s*$/i.exec(line)
+    if (!m) { kept.push(line); continue }
+    const p = m[1]
+    try {
+      if (existsSync(p) && statSync(p).size <= MAX_ATTACH_BYTES) files.push(p)
+      else process.stderr.write(`bridge: ATTACH dropped (missing or >24MB): ${p}\n`)
+    } catch {
+      process.stderr.write(`bridge: ATTACH dropped (stat failed): ${p}\n`)
+    }
+  }
+  return { text: kept.join('\n').trim(), files }
+}
+
+type ReplyPayload = string | { content?: string; files: string[] }
+function buildPayload(text: string, files: string[]): ReplyPayload {
+  // discord.js rejects an empty content string, so omit it when sending files only.
+  return files.length ? { content: text || undefined, files } : text
+}
+
+async function postReply(msg: Message, text: string, files: string[] = []): Promise<void> {
+  const payload = buildPayload(text, files)
   if (msg.channel?.isThread?.()) {
-    await msg.reply(text)
+    await msg.reply(payload)
     return
   }
   let thread = msg.thread ?? null
@@ -117,8 +149,8 @@ async function postReply(msg: Message, text: string): Promise<void> {
       }
     }
   }
-  if (thread) await thread.send(text)
-  else await msg.reply(text)
+  if (thread) await thread.send(payload)
+  else await msg.reply(payload)
 }
 
 // Warm-session variant of the agent run. Prompts the shared ACP session and
@@ -131,12 +163,13 @@ async function processViaAcp(msg: Message, prompt: string): Promise<void> {
     const raw = await getAcp().prompt(prompt)
     consecutiveTimeouts = 0
     process.stderr.write(`bridge: acp turn done in ${((Date.now() - started) / 1000).toFixed(1)}s\n`)
-    const text = extractBridgeReply(raw)
-    if (!text) {
+    const { text, files } = extractAttachments(extractBridgeReply(raw))
+    if (!text && !files.length) {
       process.stderr.write('bridge: acp returned empty reply; no Discord post\n')
       return
     }
-    await postReply(msg, text.slice(0, 2000)).catch(err => {
+    if (files.length) process.stderr.write(`bridge: attaching ${files.length} file(s)\n`)
+    await postReply(msg, text.slice(0, 2000), files).catch(err => {
       process.stderr.write(`bridge: reply failed: ${err instanceof Error ? err.message : String(err)}\n`)
     })
   } catch (err) {
@@ -216,12 +249,13 @@ async function processMessage(msg: Message): Promise<void> {
     }
 
     if (bridgeOutbound) {
-      const text = extractBridgeReply(out.stdout)
-      if (!text) {
+      const { text, files } = extractAttachments(extractBridgeReply(out.stdout))
+      if (!text && !files.length) {
         process.stderr.write('bridge: agent returned empty stdout; no Discord post\n')
         return
       }
-      await postReply(msg, text.slice(0, 2000)).catch(err => {
+      if (files.length) process.stderr.write(`bridge: attaching ${files.length} file(s)\n`)
+      await postReply(msg, text.slice(0, 2000), files).catch(err => {
         process.stderr.write(`bridge: reply failed: ${err instanceof Error ? err.message : String(err)}\n`)
       })
     }
