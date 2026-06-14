@@ -44,12 +44,32 @@ Full walkthrough: **[docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md)**
 - **Access control** — pairing, allowlists, trusted bots
 - **Self-hosted** — your token, your rules
 
+## Benchmarks
+
+Measured on a live server against the real agents. The warm ACP session (v0.2)
+cuts steady-state latency from **~10 to 12s** (cold spawn per message) to
+**~1.2 to 2.5s**, roughly **5 to 10x**, and adds shared cross-channel memory.
+
+We also raced three models on one full agentic task (read PR #5 → author an SVG →
+render with `rsvg-convert` → post the image back to Discord):
+
+| Agent | Model | Time |
+|-------|-------|------|
+| Jackie | Composer 2.5 | **42.3s** |
+| Lucy | Sonnet 4.6 | 72.0s |
+| Andrej | Opus 4.8 | 103.0s |
+
+Composer 2.5 won on speed and held up on quality; Opus produced the richest-looking
+diagram. Full writeup, the three diagrams, and the shell-harness root-cause fix:
+**[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
+
 ## More help
 
 - [docs/DISCORD_BOT.md](docs/DISCORD_BOT.md) — create a bot in Discord Developer Portal (start here if new)
 - [docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md) — Mac/laptop + nohup (recommended first)
 - [docs/VPS_SETUP.md](docs/VPS_SETUP.md) — systemd, multi-agent on a server
 - [docs/AUTH.md](docs/AUTH.md) — subscription vs API key
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — warm-bridge speedup + cross-model agentic race
 - [skills/discord-access/SKILL.md](skills/discord-access/SKILL.md) — who can talk to the bot
 
 ## License

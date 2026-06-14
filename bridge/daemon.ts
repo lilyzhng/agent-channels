@@ -15,7 +15,11 @@ import { loadStateEnv } from '../shared/env.js'
 import { buildAgentPrompt, extractBridgeReply, formatChannelBlock } from '../shared/format-inbound.js'
 import { gate } from '../shared/gate.js'
 import { ENV_FILE } from '../shared/paths.js'
+import { existsSync, realpathSync, statSync } from 'fs'
+import { tmpdir } from 'os'
+import { resolve } from 'path'
 import { ensureCursorSubscriptionAuth } from './auth.js'
+import { AcpSession } from './acp-client.js'
 import { runCursorAgent } from './run-agent.js'
 
 loadStateEnv()
@@ -51,6 +55,23 @@ const queue: Message[] = []
 const MAX_CONSECUTIVE_TIMEOUTS = Number(process.env.CDC_MAX_CONSECUTIVE_TIMEOUTS ?? 2)
 let consecutiveTimeouts = 0
 
+// Warm path: instead of a cold `cursor-agent -p` per message, hold ONE shared
+// `cursor-agent acp` session alive and prompt it each turn (~7x faster after the
+// first turn, shared cross-channel memory). Gated behind CDC_AGENT_MODE=acp so
+// the cold path stays the default until this is proven in production. The session
+// is lazy + self-healing: if the acp process dies, the next message respawns it.
+const ACP_MODE = process.env.CDC_AGENT_MODE === 'acp'
+const ACP_PROMPT_TIMEOUT_MS = Number(process.env.CURSOR_AGENT_TIMEOUT_MS ?? 1_200_000)
+let acp: AcpSession | null = null
+
+function getAcp(): AcpSession {
+  if (!acp) {
+    process.stderr.write('bridge: starting warm cursor-agent acp session\n')
+    acp = new AcpSession({ cwd: CWD, promptTimeoutMs: ACP_PROMPT_TIMEOUT_MS })
+  }
+  return acp
+}
+
 async function fetchTextChannel(id: string) {
   const ch = await client.channels.fetch(id)
   if (!ch?.isTextBased()) throw new Error(`channel ${id} not text-based`)
@@ -73,9 +94,56 @@ function replyThreadName(msg: Message): string {
   return (base ? base.slice(0, 80) : `${msg.author.username} thread`) || 'thread'
 }
 
-async function postReply(msg: Message, text: string): Promise<void> {
+// Agents reply with plain text; the bridge posts it. To send a file (an image,
+// a rendered diagram), an agent adds a line `ATTACH: /abs/path` (one per file).
+// We strip those lines and upload the files alongside the remaining text. Paths
+// must be absolute and exist; oversized/missing ones are dropped with a log so a
+// bad path never blocks the text reply.
+const MAX_ATTACH_BYTES = 24 * 1024 * 1024 // Discord's non-Nitro upload ceiling
+
+// ATTACH paths come from agent output that is driven by (untrusted) inbound
+// messages, so a prompt-injected `ATTACH: /home/.../.env` must not exfiltrate
+// secrets. Confine uploads to a few safe roots: render output in the temp dir and
+// the agent's own workspace. Symlinks are resolved (realpath) before the check so
+// a symlink inside an allowed root can't escape it. Override with CDC_ATTACH_ROOTS
+// (colon-separated).
+const ATTACH_ROOTS = (process.env.CDC_ATTACH_ROOTS ?? `/tmp:${tmpdir()}:${CWD}`)
+  .split(':').filter(Boolean).map(r => resolve(r))
+
+function attachPathAllowed(realPath: string): boolean {
+  return ATTACH_ROOTS.some(root => realPath === root || realPath.startsWith(root + '/'))
+}
+
+function extractAttachments(text: string): { text: string; files: string[] } {
+  const files: string[] = []
+  const kept: string[] = []
+  for (const line of text.split('\n')) {
+    const m = /^\s*ATTACH:\s*(\/\S.*?)\s*$/i.exec(line)
+    if (!m) { kept.push(line); continue }
+    const p = m[1]
+    try {
+      if (!existsSync(p)) { process.stderr.write(`bridge: ATTACH dropped (missing): ${p}\n`); continue }
+      const real = realpathSync(p)
+      if (!attachPathAllowed(real)) { process.stderr.write(`bridge: ATTACH dropped (outside allowed roots): ${p}\n`); continue }
+      if (statSync(real).size > MAX_ATTACH_BYTES) { process.stderr.write(`bridge: ATTACH dropped (>24MB): ${p}\n`); continue }
+      files.push(real)
+    } catch {
+      process.stderr.write(`bridge: ATTACH dropped (resolve/stat failed): ${p}\n`)
+    }
+  }
+  return { text: kept.join('\n').trim(), files }
+}
+
+type ReplyPayload = string | { content?: string; files: string[] }
+function buildPayload(text: string, files: string[]): ReplyPayload {
+  // discord.js rejects an empty content string, so omit it when sending files only.
+  return files.length ? { content: text || undefined, files } : text
+}
+
+async function postReply(msg: Message, text: string, files: string[] = []): Promise<void> {
+  const payload = buildPayload(text, files)
   if (msg.channel?.isThread?.()) {
-    await msg.reply(text)
+    await msg.reply(payload)
     return
   }
   let thread = msg.thread ?? null
@@ -99,8 +167,54 @@ async function postReply(msg: Message, text: string): Promise<void> {
       }
     }
   }
-  if (thread) await thread.send(text)
-  else await msg.reply(text)
+  if (thread) await thread.send(payload)
+  else await msg.reply(payload)
+}
+
+// Warm-session variant of the agent run. Prompts the shared ACP session and
+// posts the assembled reply. Mirrors the cold path's watchdog (consecutive
+// timeouts self-exit for a systemd restart) and adds session respawn: if the
+// acp process has died, drop our handle so the next message starts a fresh one.
+async function processViaAcp(msg: Message, prompt: string): Promise<void> {
+  const started = Date.now()
+  try {
+    const raw = await getAcp().prompt(prompt)
+    consecutiveTimeouts = 0
+    process.stderr.write(`bridge: acp turn done in ${((Date.now() - started) / 1000).toFixed(1)}s\n`)
+    const { text, files } = extractAttachments(extractBridgeReply(raw))
+    if (!text && !files.length) {
+      process.stderr.write('bridge: acp returned empty reply; no Discord post\n')
+      return
+    }
+    if (files.length) process.stderr.write(`bridge: attaching ${files.length} file(s)\n`)
+    await postReply(msg, text.slice(0, 2000), files).catch(err => {
+      process.stderr.write(`bridge: reply failed: ${err instanceof Error ? err.message : String(err)}\n`)
+    })
+  } catch (err) {
+    const text = err instanceof Error ? err.message : String(err)
+    const died = /acp exited/i.test(text)
+    if (died) {
+      acp = null // force respawn on next message
+      process.stderr.write(`bridge: acp session died (${text}); will respawn\n`)
+      await postReply(msg, 'Agent restarted. Resend that and it should answer.').catch(() => {})
+      return
+    }
+    // Treat a prompt timeout like the cold path: count it, warn, self-exit at threshold.
+    consecutiveTimeouts++
+    process.stderr.write(
+      `bridge: acp prompt failed (${consecutiveTimeouts}/${MAX_CONSECUTIVE_TIMEOUTS} consecutive): ${text}\n`,
+    )
+    // Only speak up when we're actually restarting. A single isolated timeout
+    // (followed by a successful run) is normal for a long, high-context task —
+    // posting "Agent timed out" on every one of those just spams the channel.
+    if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS) {
+      process.stderr.write(`bridge: ${consecutiveTimeouts} consecutive acp failures — exiting for systemd restart\n`)
+      await postReply(msg, 'Agent kept timing out. Restarting.').catch(() => {})
+      acp?.destroy()
+      client.destroy()
+      process.exit(1)
+    }
+  }
 }
 
 async function processMessage(msg: Message): Promise<void> {
@@ -123,6 +237,11 @@ async function processMessage(msg: Message): Promise<void> {
   const prompt = buildAgentPrompt(formatChannelBlock(msg))
   process.stderr.write(`bridge: agent run chat=${msg.channelId} user=${msg.author.username}\n`)
 
+  if (ACP_MODE) {
+    await processViaAcp(msg, prompt)
+    return
+  }
+
   const bridgeOutbound = process.env.CDC_BRIDGE_OUTBOUND !== 'mcp'
 
   try {
@@ -132,11 +251,14 @@ async function processMessage(msg: Message): Promise<void> {
       process.stderr.write(
         `bridge: agent run timed out (${consecutiveTimeouts}/${MAX_CONSECUTIVE_TIMEOUTS} consecutive)\n`,
       )
-      await postReply(msg, 'Agent timed out. Restarting if this keeps happening.').catch(() => {})
+      // Only speak up when we're actually restarting. A single isolated timeout
+      // (followed by a successful run) is normal for a long, high-context task —
+      // posting "Agent timed out" on every one of those just spams the channel.
       if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS) {
         process.stderr.write(
           `bridge: ${consecutiveTimeouts} consecutive timeouts — exiting for systemd restart\n`,
         )
+        await postReply(msg, 'Agent kept timing out. Restarting.').catch(() => {})
         client.destroy()
         process.exit(1)
       }
@@ -151,12 +273,13 @@ async function processMessage(msg: Message): Promise<void> {
     }
 
     if (bridgeOutbound) {
-      const text = extractBridgeReply(out.stdout)
-      if (!text) {
+      const { text, files } = extractAttachments(extractBridgeReply(out.stdout))
+      if (!text && !files.length) {
         process.stderr.write('bridge: agent returned empty stdout; no Discord post\n')
         return
       }
-      await postReply(msg, text.slice(0, 2000)).catch(err => {
+      if (files.length) process.stderr.write(`bridge: attaching ${files.length} file(s)\n`)
+      await postReply(msg, text.slice(0, 2000), files).catch(err => {
         process.stderr.write(`bridge: reply failed: ${err instanceof Error ? err.message : String(err)}\n`)
       })
     }
