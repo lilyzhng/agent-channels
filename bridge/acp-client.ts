@@ -1,0 +1,126 @@
+// A warm, shared Cursor Agent session over ACP (Agent Client Protocol).
+//
+// Why this exists: the bridge used to run `cursor-agent -p "<message>"` once per
+// Discord message — a cold start (binary init + MCP handshake + context re-read)
+// every time, ~10-12s on the droplet, with no memory across messages. Cursor
+// officially exposes a persistent server: `cursor-agent acp` speaks ACP (JSON-RPC
+// over stdio). This module spawns it once, opens ONE shared session, and exposes
+// prompt(text) -> reply. The cold-start cost is paid once; subsequent turns are
+// warm (~1.5s) and share a single coherent context — like Claude Code --channels.
+//
+// One shared session (not per-channel) is deliberate: Jackie is a long-running
+// assistant who should remember everything across channels. The caller tags each
+// prompt with its source (channel/thread/user) so the agent stays channel-aware.
+
+import { spawn, type ChildProcess } from 'child_process'
+import { createInterface } from 'readline'
+
+export type AcpOptions = {
+  bin?: string // path to the cursor-agent binary
+  cwd: string // workspace the agent operates in
+  promptTimeoutMs?: number
+}
+
+type Pending = { resolve: (v: unknown) => void; reject: (e: unknown) => void }
+
+export class AcpSession {
+  private proc: ChildProcess
+  private nextId = 1
+  private pending = new Map<number, Pending>()
+  private sessionId: string | null = null
+  private chunkBuf: string[] = []
+  private ready: Promise<void>
+  private promptTimeoutMs: number
+
+  constructor(opts: AcpOptions) {
+    const bin = opts.bin ?? process.env.CDC_AGENT_BIN ?? 'cursor-agent'
+    this.promptTimeoutMs = opts.promptTimeoutMs ?? 600_000
+    this.proc = spawn(bin, ['acp'], {
+      cwd: opts.cwd,
+      env: { ...process.env, CURSOR_CWD: opts.cwd },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    createInterface({ input: this.proc.stdout! }).on('line', (line) => this.onLine(line))
+    this.proc.stderr?.on('data', (b: Buffer) => process.stderr.write(`acp: ${b}`))
+    this.proc.on('exit', (code) => {
+      const err = new Error(`cursor-agent acp exited (${code})`)
+      for (const p of this.pending.values()) p.reject(err)
+      this.pending.clear()
+    })
+    this.ready = this.init(opts.cwd)
+  }
+
+  private send(obj: unknown): void {
+    this.proc.stdin!.write(JSON.stringify(obj) + '\n')
+  }
+
+  private request(method: string, params: unknown, timeoutMs?: number): Promise<any> {
+    const id = this.nextId++
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pending.delete(id)) reject(new Error(`acp ${method} timed out`))
+      }, timeoutMs ?? 60_000)
+      this.pending.set(id, {
+        resolve: (v) => { clearTimeout(timer); resolve(v) },
+        reject: (e) => { clearTimeout(timer); reject(e) },
+      })
+      this.send({ jsonrpc: '2.0', id, method, params })
+    })
+  }
+
+  private onLine(line: string): void {
+    line = line.trim()
+    if (!line) return
+    let m: any
+    try { m = JSON.parse(line) } catch { return }
+    if (m.id != null && (m.result !== undefined || m.error !== undefined)) {
+      const p = this.pending.get(m.id)
+      if (p) {
+        this.pending.delete(m.id)
+        m.error ? p.reject(m.error) : p.resolve(m.result)
+      }
+    } else if (m.method && m.id != null) {
+      this.handleAgentRequest(m) // agent -> client request
+    } else if (m.method === 'session/update') {
+      const u = m.params?.update
+      if (u?.sessionUpdate === 'agent_message_chunk') this.chunkBuf.push(u.content?.text ?? '')
+    }
+  }
+
+  // The agent can call back into the client mid-turn (permissions, fs). Keep the
+  // turn moving: auto-allow permission prompts, no-op the rest. (Tightened later.)
+  private handleAgentRequest(m: any): void {
+    const meth: string = m.method
+    if (meth.includes('request_permission')) {
+      this.send({ jsonrpc: '2.0', id: m.id, result: { outcome: { outcome: 'selected', optionId: 'allow_once' } } })
+    } else if (meth.startsWith('fs/')) {
+      this.send({ jsonrpc: '2.0', id: m.id, result: { content: '' } })
+    } else {
+      this.send({ jsonrpc: '2.0', id: m.id, result: {} })
+    }
+  }
+
+  private async init(cwd: string): Promise<void> {
+    await this.request('initialize', {
+      protocolVersion: 1,
+      clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: false },
+    })
+    const r = await this.request('session/new', { cwd, mcpServers: [] })
+    this.sessionId = r.sessionId
+  }
+
+  /** Send a prompt into the shared warm session; resolve with the assembled reply text. */
+  async prompt(text: string): Promise<string> {
+    await this.ready
+    this.chunkBuf = []
+    await this.request('session/prompt', {
+      sessionId: this.sessionId,
+      prompt: [{ type: 'text', text }],
+    }, this.promptTimeoutMs)
+    return this.chunkBuf.join('').trim()
+  }
+
+  destroy(): void {
+    try { this.proc.kill('SIGTERM') } catch { /* already gone */ }
+  }
+}
