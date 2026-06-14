@@ -186,9 +186,12 @@ async function processViaAcp(msg: Message, prompt: string): Promise<void> {
     process.stderr.write(
       `bridge: acp prompt failed (${consecutiveTimeouts}/${MAX_CONSECUTIVE_TIMEOUTS} consecutive): ${text}\n`,
     )
-    await postReply(msg, 'Agent timed out. Restarting if this keeps happening.').catch(() => {})
+    // Only speak up when we're actually restarting. A single isolated timeout
+    // (followed by a successful run) is normal for a long, high-context task —
+    // posting "Agent timed out" on every one of those just spams the channel.
     if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS) {
       process.stderr.write(`bridge: ${consecutiveTimeouts} consecutive acp failures — exiting for systemd restart\n`)
+      await postReply(msg, 'Agent kept timing out. Restarting.').catch(() => {})
       acp?.destroy()
       client.destroy()
       process.exit(1)
@@ -230,11 +233,14 @@ async function processMessage(msg: Message): Promise<void> {
       process.stderr.write(
         `bridge: agent run timed out (${consecutiveTimeouts}/${MAX_CONSECUTIVE_TIMEOUTS} consecutive)\n`,
       )
-      await postReply(msg, 'Agent timed out. Restarting if this keeps happening.').catch(() => {})
+      // Only speak up when we're actually restarting. A single isolated timeout
+      // (followed by a successful run) is normal for a long, high-context task —
+      // posting "Agent timed out" on every one of those just spams the channel.
       if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS) {
         process.stderr.write(
           `bridge: ${consecutiveTimeouts} consecutive timeouts — exiting for systemd restart\n`,
         )
+        await postReply(msg, 'Agent kept timing out. Restarting.').catch(() => {})
         client.destroy()
         process.exit(1)
       }
