@@ -113,6 +113,23 @@ Before the agentic task, the same three-way setup ran a self-contained coding ta
 - **Sonnet 4.6 sat in the middle** on speed and had the one visible execution flaw
   (clipping) on this run.
 
+### Cost (the kicker)
+
+The list-price comparison makes the speed result land harder. Jackie runs the
+standard `composer-2.5` (not the fast variant):
+
+| Model | Input ($/M tokens) | Output ($/M tokens) |
+|-------|-------------------:|--------------------:|
+| **Composer 2.5** (standard) | **$0.50** | **$2.50** |
+| Composer 2.5 (fast variant) | $3.00 | $15.00 |
+| **Sonnet 4.6** | $3.00 | $15.00 |
+
+Standard Composer 2.5 is **~6x cheaper than Sonnet 4.6** on both input and output.
+So on these tasks it was faster, at least as polished, *and* a fraction of the cost.
+(We access it through a Cursor subscription, which bundles usage; the per-token
+figures are the cost-efficiency signal, not a separate bill.) Composer is
+Cursor-only with no standalone public API.
+
 ### Method notes
 
 - n = 1 per task. Single trials, real variance exists; treat as directional, not a
