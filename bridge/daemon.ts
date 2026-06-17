@@ -21,6 +21,7 @@ import { resolve } from 'path'
 import { ensureCursorSubscriptionAuth } from './auth.js'
 import { AcpSession } from './acp-client.js'
 import { runCursorAgent } from './run-agent.js'
+import { startControlServer } from './control-socket.js'
 
 loadStateEnv()
 reconcileTrustedBots()
@@ -64,10 +65,19 @@ const ACP_MODE = process.env.CDC_AGENT_MODE === 'acp'
 const ACP_PROMPT_TIMEOUT_MS = Number(process.env.CURSOR_AGENT_TIMEOUT_MS ?? 1_200_000)
 let acp: AcpSession | null = null
 
+// Local observe socket: broadcast every turn (prompt in, streamed chunks, reply,
+// status) so `connect jackie` can watch the warm session live. Read-only for now.
+const control = startControlServer()
+
 function getAcp(): AcpSession {
   if (!acp) {
     process.stderr.write('bridge: starting warm cursor-agent acp session\n')
-    acp = new AcpSession({ cwd: CWD, promptTimeoutMs: ACP_PROMPT_TIMEOUT_MS })
+    acp = new AcpSession({
+      cwd: CWD,
+      promptTimeoutMs: ACP_PROMPT_TIMEOUT_MS,
+      onChunk: (text) => control.broadcast({ type: 'chunk', text }),
+      onUpdate: (subtype, update) => control.broadcast({ type: 'update', subtype, raw: update }),
+    })
   }
   return acp
 }
@@ -187,6 +197,7 @@ async function processViaAcp(msg: Message, prompt: string): Promise<void> {
       return
     }
     if (files.length) process.stderr.write(`bridge: attaching ${files.length} file(s)\n`)
+    control.broadcast({ type: 'reply', text, files })
     await postReply(msg, text.slice(0, 2000), files).catch(err => {
       process.stderr.write(`bridge: reply failed: ${err instanceof Error ? err.message : String(err)}\n`)
     })
@@ -196,6 +207,7 @@ async function processViaAcp(msg: Message, prompt: string): Promise<void> {
     if (died) {
       acp = null // force respawn on next message
       process.stderr.write(`bridge: acp session died (${text}); will respawn\n`)
+      control.broadcast({ type: 'status', msg: 'acp session died; will respawn on next message' })
       await postReply(msg, 'Agent restarted. Resend that and it should answer.').catch(() => {})
       return
     }
@@ -209,8 +221,10 @@ async function processViaAcp(msg: Message, prompt: string): Promise<void> {
     // posting "Agent timed out" on every one of those just spams the channel.
     if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS) {
       process.stderr.write(`bridge: ${consecutiveTimeouts} consecutive acp failures — exiting for systemd restart\n`)
+      control.broadcast({ type: 'status', msg: 'consecutive timeouts — restarting bridge' })
       await postReply(msg, 'Agent kept timing out. Restarting.').catch(() => {})
       acp?.destroy()
+      control.close()
       client.destroy()
       process.exit(1)
     }
@@ -236,6 +250,13 @@ async function processMessage(msg: Message): Promise<void> {
 
   const prompt = buildAgentPrompt(formatChannelBlock(msg))
   process.stderr.write(`bridge: agent run chat=${msg.channelId} user=${msg.author.username}\n`)
+  control.broadcast({
+    type: 'prompt',
+    source: 'discord',
+    user: msg.author.username,
+    channel: msg.channelId,
+    text: (msg.content || '').replace(/<@!?\d+>/g, '').trim(),
+  })
 
   if (ACP_MODE) {
     await processViaAcp(msg, prompt)
@@ -258,7 +279,9 @@ async function processMessage(msg: Message): Promise<void> {
         process.stderr.write(
           `bridge: ${consecutiveTimeouts} consecutive timeouts — exiting for systemd restart\n`,
         )
+        control.broadcast({ type: 'status', msg: 'consecutive timeouts — restarting bridge' })
         await postReply(msg, 'Agent kept timing out. Restarting.').catch(() => {})
+        control.close()
         client.destroy()
         process.exit(1)
       }
@@ -279,6 +302,7 @@ async function processMessage(msg: Message): Promise<void> {
         return
       }
       if (files.length) process.stderr.write(`bridge: attaching ${files.length} file(s)\n`)
+      control.broadcast({ type: 'reply', text, files })
       await postReply(msg, text.slice(0, 2000), files).catch(err => {
         process.stderr.write(`bridge: reply failed: ${err instanceof Error ? err.message : String(err)}\n`)
       })
@@ -326,10 +350,12 @@ client.on('error', e => {
 })
 
 process.on('SIGINT', () => {
+  control.close()
   client.destroy()
   process.exit(0)
 })
 process.on('SIGTERM', () => {
+  control.close()
   client.destroy()
   process.exit(0)
 })

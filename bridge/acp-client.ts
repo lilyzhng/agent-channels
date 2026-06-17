@@ -19,6 +19,12 @@ export type AcpOptions = {
   bin?: string // path to the cursor-agent binary
   cwd: string // workspace the agent operates in
   promptTimeoutMs?: number
+  // Live tap for local observers. onChunk fires per streamed agent_message_chunk
+  // (the final assembled reply is unchanged). onUpdate fires for every OTHER
+  // session/update subtype — Phase 1 discovery of what ACP surfaces (tool calls,
+  // plans, file edits). Both are best-effort; throwing handlers must not break a turn.
+  onChunk?: (text: string) => void
+  onUpdate?: (subtype: string, update: unknown) => void
 }
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: unknown) => void }
@@ -31,10 +37,14 @@ export class AcpSession {
   private chunkBuf: string[] = []
   private ready: Promise<void>
   private promptTimeoutMs: number
+  private onChunk?: (text: string) => void
+  private onUpdate?: (subtype: string, update: unknown) => void
 
   constructor(opts: AcpOptions) {
     const bin = opts.bin ?? process.env.CDC_AGENT_BIN ?? 'cursor-agent'
     this.promptTimeoutMs = opts.promptTimeoutMs ?? 600_000
+    this.onChunk = opts.onChunk
+    this.onUpdate = opts.onUpdate
     this.proc = spawn(bin, ['acp'], {
       cwd: opts.cwd,
       env: { ...process.env, CURSOR_CWD: opts.cwd },
@@ -83,7 +93,15 @@ export class AcpSession {
       this.handleAgentRequest(m) // agent -> client request
     } else if (m.method === 'session/update') {
       const u = m.params?.update
-      if (u?.sessionUpdate === 'agent_message_chunk') this.chunkBuf.push(u.content?.text ?? '')
+      const sub: string | undefined = u?.sessionUpdate
+      if (sub === 'agent_message_chunk') {
+        const text = u.content?.text ?? ''
+        this.chunkBuf.push(text)
+        if (text) { try { this.onChunk?.(text) } catch { /* observer must not break a turn */ } }
+      } else if (sub) {
+        // Any non-chunk update (tool_call, plan, file edit, ...) — surface for observers.
+        try { this.onUpdate?.(sub, u) } catch { /* best-effort */ }
+      }
     }
   }
 

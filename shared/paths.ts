@@ -20,3 +20,7 @@ export const APPROVED_DIR = join(STATE_DIR, 'approved')
 export const ENV_FILE = join(STATE_DIR, '.env')
 export const INBOX_DIR = join(STATE_DIR, 'inbox')
 export const SESSIONS_FILE = join(STATE_DIR, 'sessions.json')
+/** Local-only control socket: observe (and later steer) the warm session. */
+export const CONTROL_SOCK = join(STATE_DIR, 'control.sock')
+/** Append-only NDJSON log of turn events, for replay. */
+export const TURNS_LOG = join(STATE_DIR, 'turns.ndjson')
