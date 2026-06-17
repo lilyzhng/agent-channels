@@ -11,6 +11,7 @@ import { mkdtempSync, readFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join, dirname, resolve } from 'path'
 import { spawn } from 'child_process'
+import { connect } from 'net'
 import { fileURLToPath } from 'url'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -18,7 +19,10 @@ const stateDir = mkdtempSync(join(tmpdir(), 'cdc-smoke-'))
 process.env.CDC_STATE_DIR = stateDir
 
 const { startControlServer } = await import('../bridge/control-socket.js')
-const { TURNS_LOG } = await import('../shared/paths.js')
+const { CONTROL_SOCK, TURNS_LOG } = await import('../shared/paths.js')
+
+// Capture inbound "inject" lines (Phase 2 steer path: observer → daemon).
+const injected: string[] = []
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const fails: string[] = []
@@ -27,7 +31,14 @@ function check(cond: boolean, msg: string): void {
   process.stdout.write(`${cond ? 'ok  ' : 'FAIL'}  ${msg}\n`)
 }
 
-const server = startControlServer()
+const server = startControlServer({
+  onLine: (line) => {
+    try {
+      const m = JSON.parse(line)
+      if (m?.type === 'inject' && typeof m.text === 'string') injected.push(m.text)
+    } catch { /* ignore */ }
+  },
+})
 await sleep(150) // let the socket bind
 
 // Run the real viewer against our throwaway socket; strip ANSI to assert on text.
@@ -61,6 +72,14 @@ const logged = readFileSync(TURNS_LOG, 'utf8').trim().split('\n').map((l) => JSO
 check(logged.length === 6, `NDJSON log captured 6 events (got ${logged.length})`)
 check(logged.every((e) => typeof e.ts === 'number'), 'every logged event is timestamped')
 check(logged[0].type === 'prompt' && logged[4].type === 'reply', 'log preserved event order')
+
+// Phase 2 steer: a client inject line reaches the server's onLine → would enqueue.
+const injector = connect(CONTROL_SOCK)
+await new Promise<void>((r) => injector.on('connect', () => r()))
+injector.write(JSON.stringify({ type: 'inject', text: 'steer me jackie' }) + '\n')
+await sleep(200)
+check(injected.includes('steer me jackie'), 'inject line reached server onLine (steer path)')
+injector.destroy()
 
 observe.kill('SIGKILL')
 server.close()

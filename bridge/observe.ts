@@ -1,16 +1,18 @@
 #!/usr/bin/env tsx
-// Observe the warm bridge live.
+// Watch and talk to the warm bridge live.
 //
 // Connects to the daemon's local control socket and renders each turn as it
 // happens: the inbound prompt, Jackie's reply streaming token-by-token, any tool
-// /file updates ACP surfaces, and status (timeouts, restarts). This is the
-// read-only "watch him think" view — the attach experience Cursor's headless ACP
-// session doesn't give you.
+// /file updates ACP surfaces, and status (timeouts, restarts). Type a line and
+// hit enter to message Jackie directly — it goes into the SAME warm session
+// Discord uses (shared context), and his reply streams right back here. Just like
+// attaching to a Claude Code agent.
 //
-// Read-only and safe: Ctrl-C quits the VIEWER only; Jackie is a separate process
-// and keeps running. (Inside tmux you can also detach with Ctrl-b then d.)
+// Ctrl-C quits the VIEWER only; Jackie is a separate process and keeps running.
+// (Inside tmux you can also detach with Ctrl-b then d.)
 
 import { connect, type Socket } from 'net'
+import { createInterface } from 'readline'
 import { CONTROL_SOCK } from '../shared/paths.js'
 
 const C = {
@@ -104,13 +106,16 @@ function summarizeUpdate(raw: any): string {
   }
 }
 
+// The live socket, so the stdin reader can inject typed messages into it.
+let current: Socket | null = null
 let retrying = false
 function start(): void {
   let buf = ''
   retrying = false
   const sock: Socket = connect(CONTROL_SOCK)
   sock.on('connect', () => {
-    out(C.dim(`— connected to ${CONTROL_SOCK} — watching Jackie (Ctrl-C to quit viewer) —\n`))
+    current = sock
+    out(C.dim(`— connected to ${CONTROL_SOCK} — watching Jackie. Type a message + enter to talk to him. Ctrl-C to quit. —\n`))
   })
   sock.on('data', (b: Buffer) => {
     buf += b.toString()
@@ -123,6 +128,7 @@ function start(): void {
     }
   })
   const retry = () => {
+    current = null
     if (retrying) return // 'error' and 'close' both fire; reconnect once
     retrying = true
     newlineIfNeeded()
@@ -134,4 +140,16 @@ function start(): void {
 }
 
 start()
+
+// Type a line + enter to message Jackie. Sent as an "inject" into the warm
+// session's serial queue; his reply streams back via the broadcast above.
+const rl = createInterface({ input: process.stdin })
+rl.on('line', (line) => {
+  const text = line.trim()
+  if (!text) return
+  if (!current || current.destroyed) { out(C.dim('— not connected; message dropped —\n')); return }
+  try { current.write(JSON.stringify({ type: 'inject', text }) + '\n') }
+  catch { out(C.dim('— send failed —\n')) }
+})
+
 process.on('SIGINT', () => { process.stdout.write('\n'); process.exit(0) })

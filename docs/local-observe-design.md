@@ -38,11 +38,11 @@ Pieces:
 - **Zero risk to serial-prompt correctness** — pure read tap.
 - Delivers the core "watch him think + reply live" value.
 
-**Phase 2 — steer / inject. After Phase 1 proven.**
-- Generalize the queue: hold a discriminated `InboundTurn = DiscordTurn | LocalTurn` instead of raw `Message`. `processMessage` branches on `source` for reply routing (Discord post vs socket echo).
-- Local prompt from `observe.ts` → socket → `enqueue` → **same `drainQueue` → same warm session/context.** Reply streamed back to the terminal; optionally also posted to the originating Discord thread (`CDC_LOCAL_ECHO_DISCORD`, default off).
-- Local prompts **skip the Discord access gate** (sender is on the box = trusted) but are tagged `source=local` in the prompt block so Jackie knows it's Lily steering.
-- Risk: inbound-type refactor. Keep the single-queue serial guarantee intact.
+**Phase 2 — steer / inject. DONE.**
+- Queue generalized to `InboundTurn = {kind:'discord', msg} | {kind:'local', text}`; `processTurn` dispatches. One `runAcpTurn(prompt, deliver)` serves both — `deliver` posts to Discord for a Discord turn, no-ops for a local turn (the observer already shows the streamed reply).
+- `observe.ts` reads stdin; each typed line is sent as `{type:'inject',text}` over the socket → daemon `enqueue({kind:'local'})` → **same `drainQueue` → same warm session/context.** Reply streams back to the terminal via the broadcast.
+- **No prompt variant.** Lily's typed text goes into the warm session RAW — she's talking to Jackie directly, like attaching to a Claude Code agent. Decided against a "you're being steered from a terminal" wrapper: don't overcomplicate, don't be over-cautious. We don't post local replies to Discord ourselves; if Jackie chooses to use a Discord tool, fine, we don't care.
+- Local turns skip the Discord access gate (sender is on the box = trusted). Single-queue serial guarantee intact.
 
 ## Security
 
@@ -56,8 +56,12 @@ Pieces:
 - **edit:** `bridge/acp-client.ts` (onChunk), `bridge/daemon.ts` (emit; P2 inbound generalize), `shared/paths.ts` (`CONTROL_SOCK`), connect-agent `connect.sh` + `SKILL.md`
 - **docs:** this file
 
-## Open questions
+## Resolved
 
-1. **P2 echo:** should local-injected replies also post to Discord (thread keeps a record), or terminal-only? Proposed default: terminal-only (`CDC_LOCAL_ECHO_DISCORD=0`).
-2. **Observe richness:** does ACP surface tool-call / file-read events as other `session/update` subtypes? If yes, showing them makes guiding far more useful. Phase 1 will log all unseen `session/update` subtypes to find out.
-3. **connect verb:** keep `connect jackie` = observe (read-only) and add a separate `guide jackie` / `--steer` flag for Phase 2 inject? Or one verb that's read-write once P2 lands?
+1. **P2 echo:** terminal-only. We don't post local replies to Discord. (No `CDC_LOCAL_ECHO_DISCORD` flag — kept simple.)
+2. **No prompt variant:** raw passthrough, decided above.
+3. **connect verb:** one verb. `connect jackie` opens the viewer, which also takes typed input (watch + talk in one window).
+
+## Open
+
+- **Observe richness:** does ACP surface tool-call / file-read events as other `session/update` subtypes? `onUpdate` logs them (type `update`) so we can see what's there from real traffic and prettify `summarizeUpdate` later.
