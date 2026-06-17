@@ -46,7 +46,7 @@ const client = new Client({
 })
 
 let busy = false
-const queue: Message[] = []
+const queue: InboundTurn[] = []
 
 // Watchdog: agent runs are drained serially, so a single hung run (SIGTERM'd
 // at the timeout) blocks every channel. The process stays alive, so systemd's
@@ -65,9 +65,21 @@ const ACP_MODE = process.env.CDC_AGENT_MODE === 'acp'
 const ACP_PROMPT_TIMEOUT_MS = Number(process.env.CURSOR_AGENT_TIMEOUT_MS ?? 1_200_000)
 let acp: AcpSession | null = null
 
-// Local observe socket: broadcast every turn (prompt in, streamed chunks, reply,
-// status) so `connect jackie` can watch the warm session live. Read-only for now.
-const control = startControlServer()
+// Local control socket: broadcast every turn (prompt in, streamed chunks, reply,
+// status) so `connect jackie` can watch the warm session live, AND accept local
+// "inject" lines so Lily can steer by typing into the same serial queue Discord
+// uses (shared warm-session context). Local-only, 0600 — see control-socket.ts.
+const control = startControlServer({
+  onLine: (line) => {
+    try {
+      const m = JSON.parse(line)
+      // enqueue is a hoisted function declaration; safe to reference here.
+      if (m && m.type === 'inject' && typeof m.text === 'string' && m.text.trim()) {
+        enqueue({ kind: 'local', text: m.text.trim() })
+      }
+    } catch { /* ignore malformed control input */ }
+  },
+})
 
 function getAcp(): AcpSession {
   if (!acp) {
@@ -181,11 +193,19 @@ async function postReply(msg: Message, text: string, files: string[] = []): Prom
   else await msg.reply(payload)
 }
 
-// Warm-session variant of the agent run. Prompts the shared ACP session and
-// posts the assembled reply. Mirrors the cold path's watchdog (consecutive
-// timeouts self-exit for a systemd restart) and adds session respawn: if the
-// acp process has died, drop our handle so the next message starts a fresh one.
-async function processViaAcp(msg: Message, prompt: string): Promise<void> {
+// How a turn's reply is delivered. A Discord turn posts to its thread; a local
+// steer turn no-ops (the observer already shows the streamed reply live).
+type Deliver = (text: string, files?: string[]) => Promise<void>
+
+// An inbound turn for the shared serial queue: a Discord message, or a local
+// "steer" message Lily typed into the observe socket. Both run through the SAME
+// warm session, one at a time (chunkBuf is shared — see acp-client prompt()).
+type InboundTurn = { kind: 'discord'; msg: Message } | { kind: 'local'; text: string }
+
+// Run one turn through the shared warm ACP session and route its reply via
+// `deliver`. Mirrors the cold path's watchdog (consecutive timeouts self-exit for
+// a systemd restart) and respawns a dead acp session on the next message.
+async function runAcpTurn(prompt: string, deliver: Deliver): Promise<void> {
   const started = Date.now()
   try {
     const raw = await getAcp().prompt(prompt)
@@ -193,12 +213,12 @@ async function processViaAcp(msg: Message, prompt: string): Promise<void> {
     process.stderr.write(`bridge: acp turn done in ${((Date.now() - started) / 1000).toFixed(1)}s\n`)
     const { text, files } = extractAttachments(extractBridgeReply(raw))
     if (!text && !files.length) {
-      process.stderr.write('bridge: acp returned empty reply; no Discord post\n')
+      process.stderr.write('bridge: acp returned empty reply\n')
       return
     }
     if (files.length) process.stderr.write(`bridge: attaching ${files.length} file(s)\n`)
     control.broadcast({ type: 'reply', text, files })
-    await postReply(msg, text.slice(0, 2000), files).catch(err => {
+    await deliver(text.slice(0, 2000), files).catch(err => {
       process.stderr.write(`bridge: reply failed: ${err instanceof Error ? err.message : String(err)}\n`)
     })
   } catch (err) {
@@ -208,7 +228,7 @@ async function processViaAcp(msg: Message, prompt: string): Promise<void> {
       acp = null // force respawn on next message
       process.stderr.write(`bridge: acp session died (${text}); will respawn\n`)
       control.broadcast({ type: 'status', msg: 'acp session died; will respawn on next message' })
-      await postReply(msg, 'Agent restarted. Resend that and it should answer.').catch(() => {})
+      await deliver('Agent restarted. Resend that and it should answer.').catch(() => {})
       return
     }
     // Treat a prompt timeout like the cold path: count it, warn, self-exit at threshold.
@@ -222,7 +242,7 @@ async function processViaAcp(msg: Message, prompt: string): Promise<void> {
     if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS) {
       process.stderr.write(`bridge: ${consecutiveTimeouts} consecutive acp failures — exiting for systemd restart\n`)
       control.broadcast({ type: 'status', msg: 'consecutive timeouts — restarting bridge' })
-      await postReply(msg, 'Agent kept timing out. Restarting.').catch(() => {})
+      await deliver('Agent kept timing out. Restarting.').catch(() => {})
       acp?.destroy()
       control.close()
       client.destroy()
@@ -231,7 +251,72 @@ async function processViaAcp(msg: Message, prompt: string): Promise<void> {
   }
 }
 
-async function processMessage(msg: Message): Promise<void> {
+// Cold path (one `cursor-agent -p` per turn). Default until ACP is proven; kept
+// deliver-based so a local steer turn can run here too.
+async function runColdTurn(prompt: string, chatId: string, deliver: Deliver): Promise<void> {
+  try {
+    const out = await runCursorAgent({ cwd: CWD, prompt, chatId })
+    if (out.timedOut) {
+      consecutiveTimeouts++
+      process.stderr.write(
+        `bridge: agent run timed out (${consecutiveTimeouts}/${MAX_CONSECUTIVE_TIMEOUTS} consecutive)\n`,
+      )
+      // Only speak up when we're actually restarting. A single isolated timeout
+      // (followed by a successful run) is normal for a long, high-context task —
+      // posting "Agent timed out" on every one of those just spams the channel.
+      if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS) {
+        process.stderr.write(
+          `bridge: ${consecutiveTimeouts} consecutive timeouts — exiting for systemd restart\n`,
+        )
+        control.broadcast({ type: 'status', msg: 'consecutive timeouts — restarting bridge' })
+        await deliver('Agent kept timing out. Restarting.').catch(() => {})
+        control.close()
+        client.destroy()
+        process.exit(1)
+      }
+      return
+    }
+    consecutiveTimeouts = 0
+
+    if (out.exitCode !== 0) {
+      process.stderr.write(`bridge: agent exited ${out.exitCode}\n${out.stderr}\n`)
+      await deliver(`Agent error (exit ${out.exitCode}). Check bridge logs.`).catch(() => {})
+      return
+    }
+
+    if (process.env.CDC_BRIDGE_OUTBOUND !== 'mcp') {
+      const { text, files } = extractAttachments(extractBridgeReply(out.stdout))
+      if (!text && !files.length) {
+        process.stderr.write('bridge: agent returned empty stdout\n')
+        return
+      }
+      if (files.length) process.stderr.write(`bridge: attaching ${files.length} file(s)\n`)
+      control.broadcast({ type: 'reply', text, files })
+      await deliver(text.slice(0, 2000), files).catch(err => {
+        process.stderr.write(`bridge: reply failed: ${err instanceof Error ? err.message : String(err)}\n`)
+      })
+    }
+  } catch (err) {
+    const text = err instanceof Error ? err.message : String(err)
+    process.stderr.write(`bridge: agent spawn failed: ${text}\n`)
+    await deliver(`Failed to start agent: ${text}`).catch(() => {})
+  }
+}
+
+async function processTurn(turn: InboundTurn): Promise<void> {
+  // Local steer: send Lily's message RAW into the warm session (no wrapper — she's
+  // talking to Jackie directly, like attaching to Bill). The reply streams to her
+  // viewer via the broadcast; we don't post it to Discord.
+  if (turn.kind === 'local') {
+    process.stderr.write(`bridge: local steer turn (${turn.text.length} chars)\n`)
+    control.broadcast({ type: 'prompt', source: 'local', user: 'lily', text: turn.text })
+    const deliver: Deliver = async () => {}
+    if (ACP_MODE) await runAcpTurn(turn.text, deliver)
+    else await runColdTurn(turn.text, 'local', deliver)
+    return
+  }
+
+  const msg = turn.msg
   const result = await gate(client, msg)
 
   if (result.action === 'drop') return
@@ -258,60 +343,9 @@ async function processMessage(msg: Message): Promise<void> {
     text: (msg.content || '').replace(/<@!?\d+>/g, '').trim(),
   })
 
-  if (ACP_MODE) {
-    await processViaAcp(msg, prompt)
-    return
-  }
-
-  const bridgeOutbound = process.env.CDC_BRIDGE_OUTBOUND !== 'mcp'
-
-  try {
-    const out = await runCursorAgent({ cwd: CWD, prompt, chatId: msg.channelId })
-    if (out.timedOut) {
-      consecutiveTimeouts++
-      process.stderr.write(
-        `bridge: agent run timed out (${consecutiveTimeouts}/${MAX_CONSECUTIVE_TIMEOUTS} consecutive)\n`,
-      )
-      // Only speak up when we're actually restarting. A single isolated timeout
-      // (followed by a successful run) is normal for a long, high-context task —
-      // posting "Agent timed out" on every one of those just spams the channel.
-      if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS) {
-        process.stderr.write(
-          `bridge: ${consecutiveTimeouts} consecutive timeouts — exiting for systemd restart\n`,
-        )
-        control.broadcast({ type: 'status', msg: 'consecutive timeouts — restarting bridge' })
-        await postReply(msg, 'Agent kept timing out. Restarting.').catch(() => {})
-        control.close()
-        client.destroy()
-        process.exit(1)
-      }
-      return
-    }
-    consecutiveTimeouts = 0
-
-    if (out.exitCode !== 0) {
-      process.stderr.write(`bridge: agent exited ${out.exitCode}\n${out.stderr}\n`)
-      await postReply(msg, `Agent error (exit ${out.exitCode}). Check bridge logs.`).catch(() => {})
-      return
-    }
-
-    if (bridgeOutbound) {
-      const { text, files } = extractAttachments(extractBridgeReply(out.stdout))
-      if (!text && !files.length) {
-        process.stderr.write('bridge: agent returned empty stdout; no Discord post\n')
-        return
-      }
-      if (files.length) process.stderr.write(`bridge: attaching ${files.length} file(s)\n`)
-      control.broadcast({ type: 'reply', text, files })
-      await postReply(msg, text.slice(0, 2000), files).catch(err => {
-        process.stderr.write(`bridge: reply failed: ${err instanceof Error ? err.message : String(err)}\n`)
-      })
-    }
-  } catch (err) {
-    const text = err instanceof Error ? err.message : String(err)
-    process.stderr.write(`bridge: agent spawn failed: ${text}\n`)
-    await msg.reply(`Failed to start agent: ${text}`).catch(() => {})
-  }
+  const deliver: Deliver = (text, files = []) => postReply(msg, text, files)
+  if (ACP_MODE) await runAcpTurn(prompt, deliver)
+  else await runColdTurn(prompt, msg.channelId, deliver)
 }
 
 async function drainQueue(): Promise<void> {
@@ -319,16 +353,16 @@ async function drainQueue(): Promise<void> {
   busy = true
   try {
     while (queue.length > 0) {
-      const msg = queue.shift()!
-      await processMessage(msg)
+      const turn = queue.shift()!
+      await processTurn(turn)
     }
   } finally {
     busy = false
   }
 }
 
-function enqueue(msg: Message): void {
-  queue.push(msg)
+function enqueue(turn: InboundTurn): void {
+  queue.push(turn)
   void drainQueue()
 }
 
@@ -338,7 +372,7 @@ client.on('messageCreate', msg => {
     const trusted = loadAccess().trustedBots ?? []
     if (!trusted.includes(msg.author.id)) return
   }
-  enqueue(msg)
+  enqueue({ kind: 'discord', msg })
 })
 
 client.once('ready', c => {
