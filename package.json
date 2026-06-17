@@ -6,8 +6,10 @@
   "description": "Discord bridge + MCP tools for Cursor agents — local (nohup) or VPS",
   "scripts": {
     "bridge": "tsx bridge/daemon.ts",
+    "observe": "tsx bridge/observe.ts",
     "mcp": "CDC_MCP_ONLY=1 tsx mcp/server.ts",
     "sync-mcp": "bash scripts/sync-discord-mcp.sh",
+    "smoke-observe": "tsx scripts/smoke-observe.ts",
     "typecheck": "tsc --noEmit"
   },
   "engines": {
