@@ -109,6 +109,13 @@ function summarizeUpdate(raw: any): string {
 // The live socket, so the stdin reader can inject typed messages into it.
 let current: Socket | null = null
 let retrying = false
+// Lines typed before the socket is connected (or during a reconnect) wait here
+// and flush on connect, so a fast first message is never dropped.
+const pending: string[] = []
+function sendInject(text: string): void {
+  const line = JSON.stringify({ type: 'inject', text }) + '\n'
+  try { current!.write(line) } catch { out(C.dim('— send failed —\n')) }
+}
 function start(): void {
   let buf = ''
   retrying = false
@@ -116,6 +123,7 @@ function start(): void {
   sock.on('connect', () => {
     current = sock
     out(C.dim(`— connected to ${CONTROL_SOCK} — watching Jackie. Type a message + enter to talk to him. Ctrl-C to quit. —\n`))
+    while (pending.length) sendInject(pending.shift()!)
   })
   sock.on('data', (b: Buffer) => {
     buf += b.toString()
@@ -147,9 +155,8 @@ const rl = createInterface({ input: process.stdin })
 rl.on('line', (line) => {
   const text = line.trim()
   if (!text) return
-  if (!current || current.destroyed) { out(C.dim('— not connected; message dropped —\n')); return }
-  try { current.write(JSON.stringify({ type: 'inject', text }) + '\n') }
-  catch { out(C.dim('— send failed —\n')) }
+  if (current && !current.destroyed) sendInject(text)
+  else pending.push(text) // not connected yet — flush on connect
 })
 
 process.on('SIGINT', () => { process.stdout.write('\n'); process.exit(0) })
