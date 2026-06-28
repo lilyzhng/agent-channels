@@ -18,13 +18,13 @@ import { ENV_FILE } from '../shared/paths.js'
 import { existsSync, realpathSync, statSync } from 'fs'
 import { tmpdir } from 'os'
 import { resolve } from 'path'
-import { ensureCursorSubscriptionAuth } from './auth.js'
+import { ensureAgentAuth } from './auth.js'
 import { AcpSession } from './acp-client.js'
 import { runCursorAgent } from './run-agent.js'
 
 loadStateEnv()
 reconcileTrustedBots()
-ensureCursorSubscriptionAuth()
+ensureAgentAuth()
 
 const TOKEN = process.env.DISCORD_BOT_TOKEN
 if (!TOKEN) {
