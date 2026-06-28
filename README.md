@@ -1,4 +1,4 @@
-# agent-discord-channels
+# agent-channels
 
 **Talk to your AI coding agents in Discord — one unified memory across every channel**
 
@@ -40,8 +40,8 @@ Each prompt is tagged with its source (channel/thread/user) so the agent stays c
 ## Quick start (local)
 
 ```bash
-git clone https://github.com/lilyzhng/agent-discord-channels.git
-cd agent-discord-channels
+git clone https://github.com/lilyzhng/agent-channels.git
+cd agent-channels
 npm install
 ```
 
