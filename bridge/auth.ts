@@ -1,15 +1,19 @@
+import { basename } from 'path'
 import { spawnAgentSync, agentBin } from './cursor-bin.js'
 
-/** Subscription login via `agent login` — not API key billing.
+/** Ensure the configured CLI agent is authenticated.
  *
  * Agent-agnostic: detects whether CDC_AGENT_BIN points at Devin CLI or Cursor
  * CLI and runs the appropriate auth-status subcommand:
  *   Cursor: `agent status`
  *   Devin:  `devin auth status`
+ *
+ * Uses basename comparison so wrapper dirs like `/foo/devin-tools/bin/x`
+ * don't false-match the substring "devin".
  */
-export function ensureCursorSubscriptionAuth(): void {
+export function ensureAgentAuth(): void {
   const bin = agentBin()
-  const isDevin = bin.includes('devin')
+  const isDevin = basename(bin) === 'devin'
 
   const r = isDevin
     ? spawnAgentSync('auth', ['status'])
