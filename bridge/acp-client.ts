@@ -110,7 +110,13 @@ export class AcpSession {
   private handleAgentRequest(m: any): void {
     const meth: string = m.method
     if (meth.includes('request_permission')) {
-      this.send({ jsonrpc: '2.0', id: m.id, result: { outcome: { outcome: 'selected', optionId: 'allow_once' } } })
+      // Option ids are agent-specific (cursor: 'allow_once', kimi: 'approve', ...),
+      // so pick by the ACP-standard `kind` instead of hardcoding an id.
+      const opts: any[] = m.params?.options ?? []
+      const pick = opts.find((o) => o.kind === 'allow_always')
+        ?? opts.find((o) => o.kind === 'allow_once')
+        ?? opts[0]
+      this.send({ jsonrpc: '2.0', id: m.id, result: { outcome: { outcome: 'selected', optionId: pick?.optionId ?? 'allow_once' } } })
     } else if (meth.startsWith('fs/')) {
       this.send({ jsonrpc: '2.0', id: m.id, result: { content: '' } })
     } else {

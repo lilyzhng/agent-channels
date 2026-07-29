@@ -1,15 +1,23 @@
-# cursor-discord-channels
+# agent-channels
 
-**Talk to your cursor agents in Discord, get the work done**
+**Talk to your CLI agents in Discord, get the work done**
 
-Discord bridge + MCP tools for Cursor. When someone @mentions your bot, a small **bridge** wakes the **Cursor CLI agent** (Composer by default); the bridge posts the reply as **your bot** (default), or the agent can use **Discord MCP** tools in legacy mode.
+Discord bridge + MCP tools for CLI coding agents. When someone @mentions your bot, a small **bridge** wakes a warm **ACP agent session**; the bridge posts the reply as **your bot** (default), or the agent can use **Discord MCP** tools in legacy mode.
+
+Supported agents (any CLI that speaks ACP works — set `CDC_AGENT_BIN`):
+
+| Agent | Model examples | Auth |
+|-------|----------------|------|
+| **Cursor CLI** (default) | Composer | `agent login` (subscription) |
+| **Kimi Code CLI** | Kimi K3 (`k3`) | `kimi login` (Kimi Code subscription) |
+| **Devin CLI** | GLM 5.2 | `devin auth login` |
 
 ```
-Discord  →  bridge  →  cursor agent  →  bridge posts reply (default)
+Discord  →  bridge  →  ACP agent (cursor / kimi / devin)  →  bridge posts reply (default)
                               ↳ or Discord MCP when CDC_BRIDGE_OUTBOUND=mcp
 ```
 
-Uses your **Cursor subscription** — no separate API bill. No VPS required to get started.
+Uses your **agent subscription** — no separate API bill. No VPS required to get started.
 
 ## Choose your setup
 
@@ -25,8 +33,8 @@ Uses your **Cursor subscription** — no separate API bill. No VPS required to g
 ## Quick start (local)
 
 ```bash
-git clone https://github.com/lilyzhng/cursor-discord-channels.git
-cd cursor-discord-channels
+git clone https://github.com/lilyzhng/agent-channels.git
+cd agent-channels
 npm install
 ```
 
@@ -36,6 +44,20 @@ npm install
 4. `npm run bridge` — or `bash scripts/start-bridge-local.sh` for background
 
 Full walkthrough: **[docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md)**
+
+### Using Kimi Code (Kimi K3)
+
+```bash
+uv tool install --python 3.13 kimi-cli
+kimi login                      # ACP mode needs the OAuth login, not an API key
+export CDC_AGENT_BIN=$(which kimi)
+export CDC_AGENT_MODE=acp
+```
+
+Set the model in `~/.kimi/config.toml` (`default_model = "k3"`, provider `type = "kimi"`,
+`base_url = "https://api.kimi.com/coding/v1"`). Keep `default_thinking = false` for fast turns.
+The bridge auto-approves the agent's permission prompts by ACP option kind, so Kimi's
+tool calls run unattended just like Cursor's.
 
 ## What you get
 
