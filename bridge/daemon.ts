@@ -56,6 +56,33 @@ const queue: InboundTurn[] = []
 const MAX_CONSECUTIVE_TIMEOUTS = Number(process.env.CDC_MAX_CONSECUTIVE_TIMEOUTS ?? 2)
 let consecutiveTimeouts = 0
 
+// Mention-loop guard. Agents without cross-turn thread memory (kimi acp) re-answer
+// every fresh @mention with a near-identical re-post of their previous reply, which
+// reads as spam (observed: 3-4 duplicate reports per thread per night). Suppress a
+// reply whose content is mostly contained in what we just posted to the same channel.
+// Containment, not equality: the re-posts are shortened rewrites, never exact dupes.
+const DEDUP_WINDOW_MS = Number(process.env.CDC_DEDUP_WINDOW_MS ?? 15 * 60_000)
+const DEDUP_CONTAINMENT = 0.85
+const lastReplies = new Map<string, { words: Set<string>; at: number }>()
+
+function replyWords(text: string): Set<string> {
+  return new Set(text.toLowerCase().replace(/<[@#][!&]?\d+>/g, '').match(/[\p{L}\p{N}]{2,}/gu) ?? [])
+}
+
+function isDuplicateReply(channelId: string, text: string): boolean {
+  const prev = lastReplies.get(channelId)
+  if (!prev || Date.now() - prev.at > DEDUP_WINDOW_MS) return false
+  const words = replyWords(text)
+  if (words.size < 8) return false // short acks are fine to repeat
+  let contained = 0
+  for (const w of words) if (prev.words.has(w)) contained++
+  return contained / words.size >= DEDUP_CONTAINMENT
+}
+
+function rememberReply(channelId: string, text: string): void {
+  lastReplies.set(channelId, { words: replyWords(text), at: Date.now() })
+}
+
 // Warm path: instead of a cold `cursor-agent -p` per message, hold ONE shared
 // `cursor-agent acp` session alive and prompt it each turn (~7x faster after the
 // first turn, shared cross-channel memory). Gated behind CDC_AGENT_MODE=acp so
@@ -205,7 +232,7 @@ type InboundTurn = { kind: 'discord'; msg: Message } | { kind: 'local'; text: st
 // Run one turn through the shared warm ACP session and route its reply via
 // `deliver`. Mirrors the cold path's watchdog (consecutive timeouts self-exit for
 // a systemd restart) and respawns a dead acp session on the next message.
-async function runAcpTurn(prompt: string, deliver: Deliver): Promise<void> {
+async function runAcpTurn(prompt: string, deliver: Deliver, dedupKey?: string): Promise<void> {
   const started = Date.now()
   try {
     const raw = await getAcp().prompt(prompt)
@@ -216,11 +243,18 @@ async function runAcpTurn(prompt: string, deliver: Deliver): Promise<void> {
       process.stderr.write('bridge: acp returned empty reply\n')
       return
     }
+    if (dedupKey && !files.length && isDuplicateReply(dedupKey, text)) {
+      process.stderr.write(`bridge: suppressed duplicate reply in ${dedupKey} (mention-loop guard)\n`)
+      control.broadcast({ type: 'status', msg: `duplicate reply suppressed in ${dedupKey}` })
+      rememberReply(dedupKey, text) // keep comparing against the LATEST rewrite, not the first
+      return
+    }
     if (files.length) process.stderr.write(`bridge: attaching ${files.length} file(s)\n`)
     control.broadcast({ type: 'reply', text, files })
     await deliver(text.slice(0, 2000), files).catch(err => {
       process.stderr.write(`bridge: reply failed: ${err instanceof Error ? err.message : String(err)}\n`)
     })
+    if (dedupKey) rememberReply(dedupKey, text)
   } catch (err) {
     const text = err instanceof Error ? err.message : String(err)
     const died = /acp exited/i.test(text)
@@ -344,7 +378,7 @@ async function processTurn(turn: InboundTurn): Promise<void> {
   })
 
   const deliver: Deliver = (text, files = []) => postReply(msg, text, files)
-  if (ACP_MODE) await runAcpTurn(prompt, deliver)
+  if (ACP_MODE) await runAcpTurn(prompt, deliver, msg.channelId)
   else await runColdTurn(prompt, msg.channelId, deliver)
 }
 
