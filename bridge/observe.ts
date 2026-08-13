@@ -78,6 +78,10 @@ function render(ev: any): void {
       break
     }
     case 'update': {
+      // Quiet by default: thought fragments and per-keystroke tool_call_update
+      // spam make the attach view unreadable. CDC_OBSERVE_VERBOSE=1 restores all.
+      if (process.env.CDC_OBSERVE_VERBOSE !== '1' &&
+          (ev.subtype === 'agent_thought_chunk' || ev.subtype === 'tool_call_update')) break
       newlineIfNeeded()
       const detail = summarizeUpdate(ev.raw)
       out(C.magenta(`  · ${ev.subtype}`) + (detail ? C.dim(` ${detail}`) : '') + '\n')
