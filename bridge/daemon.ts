@@ -15,7 +15,7 @@ import { loadStateEnv } from '../shared/env.js'
 import { buildAgentPrompt, extractBridgeReply, formatChannelBlock } from '../shared/format-inbound.js'
 import { gate } from '../shared/gate.js'
 import { ENV_FILE } from '../shared/paths.js'
-import { existsSync, realpathSync, statSync } from 'fs'
+import { existsSync, mkdirSync, readdirSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { resolve } from 'path'
 import { ensureCursorSubscriptionAuth } from './auth.js'
@@ -181,6 +181,51 @@ function extractAttachments(text: string): { text: string; files: string[] } {
     }
   }
   return { text: kept.join('\n').trim(), files }
+}
+
+// Inbound images: a Discord attachment is invisible to the agent unless we
+// materialize it — the channel block only carried filename/size metadata, so the
+// agent knew an image existed but could never look at it. Download image
+// attachments to disk and hand the paths to formatChannelBlock, which points the
+// agent at them. Best-effort: a failed download degrades to metadata-only.
+const INBOUND_IMAGE_DIR = resolve(process.env.CDC_STATE_DIR ?? tmpdir(), 'inbound-attachments')
+const MAX_INBOUND_IMAGE_BYTES = 20 * 1024 * 1024
+const INBOUND_IMAGE_TTL_MS = 7 * 24 * 60 * 60 * 1000
+
+function pruneInboundImages(): void {
+  try {
+    const cutoff = Date.now() - INBOUND_IMAGE_TTL_MS
+    for (const name of readdirSync(INBOUND_IMAGE_DIR)) {
+      try {
+        const p = resolve(INBOUND_IMAGE_DIR, name)
+        if (statSync(p).mtimeMs < cutoff) unlinkSync(p)
+      } catch { /* race with another prune is harmless */ }
+    }
+  } catch { /* dir may not exist yet */ }
+}
+
+async function downloadInboundImages(msg: Message): Promise<string[]> {
+  const images = [...msg.attachments.values()].filter(a =>
+    (a.contentType ?? '').startsWith('image/') && (a.size ?? 0) <= MAX_INBOUND_IMAGE_BYTES,
+  )
+  if (!images.length) return []
+  mkdirSync(INBOUND_IMAGE_DIR, { recursive: true })
+  pruneInboundImages()
+  const paths: string[] = []
+  for (const att of images) {
+    try {
+      const res = await fetch(att.url)
+      if (!res.ok) throw new Error(`http ${res.status}`)
+      const buf = Buffer.from(await res.arrayBuffer())
+      const safeName = (att.name ?? att.id).replace(/[^\w.-]/g, '_')
+      const p = resolve(INBOUND_IMAGE_DIR, `${msg.id}-${safeName}`)
+      writeFileSync(p, buf)
+      paths.push(p)
+    } catch (err) {
+      process.stderr.write(`bridge: inbound image download failed (${att.name ?? att.id}): ${err instanceof Error ? err.message : String(err)}\n`)
+    }
+  }
+  return paths
 }
 
 type ReplyPayload = string | { content?: string; files: string[] }
@@ -367,14 +412,16 @@ async function processTurn(turn: InboundTurn): Promise<void> {
   const ack = result.access.ackReaction ?? '👀'
   if (ack) void msg.react(ack).catch(() => {})
 
-  const prompt = buildAgentPrompt(formatChannelBlock(msg))
+  const imagePaths = await downloadInboundImages(msg)
+  const prompt = buildAgentPrompt(formatChannelBlock(msg, imagePaths))
   process.stderr.write(`bridge: agent run chat=${msg.channelId} user=${msg.author.username}\n`)
   control.broadcast({
     type: 'prompt',
     source: 'discord',
     user: msg.author.username,
     channel: msg.channelId,
-    text: (msg.content || '').replace(/<@!?\d+>/g, '').trim(),
+    text: (msg.content || '').replace(/<@!?\d+>/g, '').trim()
+      + (imagePaths.length ? `\n[${imagePaths.length} image(s) attached]` : ''),
   })
 
   const deliver: Deliver = (text, files = []) => postReply(msg, text, files)

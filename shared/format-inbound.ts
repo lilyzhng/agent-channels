@@ -5,7 +5,7 @@ function safeAttName(name: string, id: string): string {
   return (name ?? id).replace(/[\[\]\r\n;]/g, '_')
 }
 
-export function formatChannelBlock(msg: Message): string {
+export function formatChannelBlock(msg: Message, imagePaths: string[] = []): string {
   const atts: string[] = []
   for (const att of msg.attachments.values()) {
     const kb = (att.size / 1024).toFixed(0)
@@ -19,9 +19,17 @@ export function formatChannelBlock(msg: Message): string {
       ? ` attachment_count="${atts.length}" attachments="${atts.join('; ')}"`
       : ''
 
+  // Image attachments the bridge materialized to local disk (see daemon.ts
+  // downloadInboundImages). Without a path the agent only saw the metadata above
+  // and had no way to actually look at the image.
+  const imageLines = imagePaths.map(
+    p => `[attached image saved at: ${p} — view it with your Read tool before replying]`,
+  )
+
   return [
     `<channel source="discord" chat_id="${msg.channelId}" message_id="${msg.id}" user="${msg.author.username}" user_id="${msg.author.id}" ts="${msg.createdAt.toISOString()}"${attAttrs}>`,
     content,
+    ...imageLines,
     '</channel>',
   ].join('\n')
 }
